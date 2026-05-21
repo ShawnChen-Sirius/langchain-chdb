@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-chdb"
+version = "0.1.0a0"
+description = "LangChain provider for chDB — vector store, document loader, chat history, and SQL backend for LangChain agents. In-process OLAP with native vectors and federation to remote ClickHouse."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Shawn Chen", email = "changshuo.chen@clickhouse.com" },
+]
+keywords = ["langchain", "chdb", "clickhouse", "olap", "vector-store", "rag", "ai", "agent", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "chdb>=4.1.0",
+    "langchain-core>=1.2,<2.0",
+]
+
+[project.optional-dependencies]
+# SQLDatabaseToolkit path — pulls the SQLAlchemy dialect transitively.
+sql = [
+    "chdb-sqlalchemy>=0.2.1",
+]
+# Unit + contract tests. `langchain-tests` ships the VectorStoreIntegrationTests
+# conformance suite required by Step 3 of the v0.1 plan.
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pandas>=2.2",
+    "pyarrow>=15",
+    "langchain-community>=0.3",
+    "langchain-tests>=0.4",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+# Heavy embedder fixtures. Gated to nightly / local runs, not default PR CI.
+test-integration = [
+    "langchain-huggingface>=0.2",
+    "sentence-transformers>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/chdb-io/langchain-chdb"
+Repository = "https://github.com/chdb-io/langchain-chdb"
+Issues = "https://github.com/chdb-io/langchain-chdb/issues"
+Documentation = "https://github.com/chdb-io/langchain-chdb#readme"
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_chdb"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+markers = [
+    "integration: requires the [test-integration] extra (HF embedder, real network for model download)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "RUF001", # ambiguous unicode in string — em-dashes are intentional
+    "RUF002", # ambiguous unicode in docstring — em-dashes are intentional
+    "RUF022", # __all__ unsorted — semantic grouping preferred
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_unused_ignores = true
+ignore_missing_imports = true
+warn_return_any = false
+disable_error_code = ["override", "assignment", "no-untyped-def", "misc"]

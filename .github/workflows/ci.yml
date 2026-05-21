@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint + type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v3
+      - name: Install package and dev extras
+        run: uv pip install --system -e ".[sql,test]"
+      - name: Ruff
+        run: uv run --no-project ruff check .
+      - name: Mypy
+        run: uv run --no-project mypy langchain_chdb
+
+  # Hard-Constraint 1 gate: shipped artifacts must not contain comparative
+  # language referencing other libraries / products. Internal planning docs
+  # (./docs/decisions/*) are exempt because they record trade-offs that
+  # explicitly compare alternatives — they are not shipped to PyPI.
+  no-comparative-language:
+    name: No comparative language in shipped artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep gate
+        run: |
+          set -euo pipefail
+          # Forbidden patterns, case-insensitive.
+          # Matches: mirror duckdb, like postgres, chroma-compatible, similar to qdrant, …
+          PATTERN='mirror[- ](duckdb|postgres|chroma|pgvector|qdrant|weaviate|milvus|pinecone)|(duckdb|postgres|chroma|pgvector|qdrant|weaviate|milvus|pinecone)[- ]compatible|like (duckdb|postgres|chroma|pgvector|qdrant|weaviate|milvus|pinecone)|similar to (duckdb|postgres|chroma|pgvector|qdrant|weaviate|milvus|pinecone)'
+
+          # Scan langchain_chdb/, top-level README/CHANGELOG, but exclude
+          # docs/decisions/ (explicitly allowed to reference alternatives).
+          if grep -rEin "$PATTERN" \
+              --include="*.py" --include="*.md" --include="*.mdx" \
+              langchain_chdb/ README.md \
+              $( [ -f CHANGELOG.md ] && echo "CHANGELOG.md" ) \
+              $( [ -d docs ] && find docs -type f \( -name "*.md" -o -name "*.mdx" -o -name "*.py" \) -not -path "docs/decisions/*" ) \
+              2>/dev/null; then
+            echo "::error::Comparative language found in shipped artifacts. See Hard Constraint 1 in docs/langchain_chdb_v0_1_plan.md."
+            exit 1
+          fi
+          echo "No comparative language found in shipped artifacts."
+
+  unit:
+    name: Unit (Py ${{ matrix.python }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v3
+      - name: Install package with sql + test extras
+        run: uv pip install --system -e ".[sql,test]"
+      - name: Pytest (unit + contract, excludes integration)
+        run: uv run --no-project pytest -v -m "not integration"
