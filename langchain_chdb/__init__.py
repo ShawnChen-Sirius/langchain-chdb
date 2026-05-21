@@ -20,10 +20,14 @@ Public classes are added incrementally as the v0.1 plan steps land.
 from __future__ import annotations
 
 from langchain_chdb.document_loaders import ChDBLoader
+from langchain_chdb.vectorstores import ChDB, ChDBVectorStore, DistanceStrategy
 
 __version__ = "0.1.0a0"
 
 __all__ = [
+    "ChDB",
     "ChDBLoader",
+    "ChDBVectorStore",
+    "DistanceStrategy",
     "__version__",
 ]

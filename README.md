@@ -39,6 +39,25 @@ docs = loader.load()
 
 A single-column `page_content_columns` returns the raw cell as `Document.page_content`; multi-column or `None` serializes the listed columns as `col: value` lines. Bad column names raise `ValueError` on first row. See [`docs/decisions/loader_page_content_format.md`](docs/decisions/loader_page_content_format.md) for the rationale.
 
+### `ChDBVectorStore`
+
+```python
+from langchain_chdb import ChDBVectorStore, DistanceStrategy
+from langchain_openai import OpenAIEmbeddings
+
+store = ChDBVectorStore.from_texts(
+    texts=["chDB is an embedded ClickHouse.", "It runs SQL on local files."],
+    embedding=OpenAIEmbeddings(),
+    embedding_dimension=1536,
+    database="./chdb-store",
+    distance_strategy=DistanceStrategy.COSINE,
+)
+
+results = store.similarity_search("which engine embeds ClickHouse?", k=1)
+```
+
+Backed by an `Array(Float32)` column with a `length(embedding) = N` `CHECK` constraint, indexed with `MergeTree() ORDER BY id`. Supports `DistanceStrategy.COSINE` / `EUCLIDEAN` / `MAX_INNER_PRODUCT`, a whitelist metadata-filter DSL (`$in`, `$gt`/`$gte`/`$lt`/`$lte`/`$ne`, `$and`/`$or`/`$not`), idempotent upsert via `DELETE WHERE id IN (...) SETTINGS mutations_sync = 1` then `INSERT`, and `score_threshold` filtering on relevance. Passes LangChain's full `VectorStoreIntegrationTests` conformance suite. The short alias `ChDB = ChDBVectorStore` is exported for brevity.
+
 ### SQLDatabaseToolkit integration
 
 chDB plugs into LangChain's `SQLDatabaseToolkit` through the [`chdb-sqlalchemy`](https://github.com/chdb-io/chdb-sqlalchemy) dialect, exposed under the `[sql]` extra:
@@ -57,26 +76,9 @@ The chdb-sqlalchemy dialect handles reflection, type mapping, and the introspect
 
 ## In progress — landing in 0.1.0
 
-The classes below are part of the 0.1.0 surface and are landing
-incrementally. They are **not yet exported**; the snippets are a preview
-of the planned API, not runnable on `0.1.0a*`.
-
-### `ChDBVectorStore` (planned)
-
-```text
-# Preview — landing in 0.1.0, not yet importable on 0.1.0a*:
-# from langchain_chdb import ChDBVectorStore
-#
-# store = ChDBVectorStore.from_texts(
-#     texts=["chDB is an embedded ClickHouse.", "It runs SQL on local files."],
-#     embedding=OpenAIEmbeddings(),
-#     embedding_dimension=1536,
-#     database="./chdb-store",
-# )
-# results = store.similarity_search("which engine embeds ClickHouse?", k=1)
-```
-
-Backed by `Array(Float32)` columns and the ClickHouse vector-distance functions (`cosineDistance` / `L2Distance` / `dotProduct`). The constructor short alias `ChDB = ChDBVectorStore` will be exported for brevity. LangChain's `VectorStoreIntegrationTests` is the gating contract for the implementation.
+The class below is part of the 0.1.0 surface and is landing next. It is
+**not yet exported**; the snippet is a preview of the planned API, not
+runnable on the current pre-release.
 
 ### `ChDBChatMessageHistory` (planned)
 
