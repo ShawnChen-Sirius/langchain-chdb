@@ -14,14 +14,16 @@ ClickHouse — to LangChain through:
 The SQLDatabaseToolkit path is available via the ``[sql]`` extra, which
 pulls in the ``chdb-sqlalchemy`` dialect.
 
-Public classes are added incrementally as the v0.1 plan steps land:
-this initial commit ships only the package metadata + version constant.
+Public classes are added incrementally as the v0.1 plan steps land.
 """
 
 from __future__ import annotations
 
+from langchain_chdb.document_loaders import ChDBLoader
+
 __version__ = "0.1.0a0"
 
 __all__ = [
+    "ChDBLoader",
     "__version__",
 ]

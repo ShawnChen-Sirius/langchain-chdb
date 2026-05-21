@@ -55,7 +55,7 @@ jobs:
               $( [ -f CHANGELOG.md ] && echo "CHANGELOG.md" ) \
               $( [ -d docs ] && find docs -type f \( -name "*.md" -o -name "*.mdx" -o -name "*.py" \) -not -path "docs/decisions/*" ) \
               2>/dev/null; then
-            echo "::error::Comparative language found in shipped artifacts. See Hard Constraint 1 in docs/langchain_chdb_v0_1_plan.md."
+            echo "::error::Comparative language referencing alternative libraries is not allowed in shipped artifacts (langchain_chdb/, README, CHANGELOG, docs/). Decision records under docs/decisions/ are exempt because they record explicit trade-offs by design."
             exit 1
           fi
           echo "No comparative language found in shipped artifacts."
