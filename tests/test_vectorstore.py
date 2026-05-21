@@ -86,9 +86,16 @@ def test_repeated_id_in_same_batch_collapses_to_one_row():
             Document(id="1", page_content="last"),
         ]
     )
+    # Exactly one row is stored, not two with id-equal duplicates.
     docs = store.get_by_ids(["1"])
     assert len(docs) == 1
     assert docs[0].page_content == "last"
+
+    # And the physical table has no shadow duplicate — similarity_search
+    # must see only one row, not "first" followed by "last".
+    hits = store.similarity_search("anything", k=10)
+    assert len(hits) == 1
+    assert hits[0].page_content == "last"
 
 
 def test_repeated_id_across_batches_overwrites():
@@ -432,11 +439,18 @@ def test_persistence_round_trip(tmp_path):
         s1.close()
 
         # Phase 2 — fresh ChDBVectorStore against the SAME on-disk path.
+        # Uses only the public API; the read path must probe the on-disk
+        # table without help from private setup.
         s2 = ChDBVectorStore(_E(), database={str(db)!r}, embedding_dimension=4)
-        s2._ensure_table(embedding_dim=4)
         docs = s2.get_by_ids(["1", "2"])
         ids = sorted(d.id for d in docs)
         assert ids == ["1", "2"], f"expected ['1', '2'], got {{ids!r}}"
+
+        # similarity_search must also work without any prior write on s2.
+        hits = s2.similarity_search("anything", k=5)
+        contents = sorted(h.page_content for h in hits)
+        assert contents == ["alpha", "beta"], f"got {{contents!r}}"
+
         s2.close()
         print("PERSIST_OK")
     """)
@@ -523,6 +537,60 @@ def test_relevance_mapping_euclidean_is_inverse():
     )
     assert store._raw_score_to_relevance(0.0) == 1.0
     assert math.isclose(store._raw_score_to_relevance(1.0), 0.5)
+
+
+def test_score_threshold_filters_low_relevance_pairs():
+    """``score_threshold`` drops pairs below the threshold relevance."""
+    store = ChDBVectorStore(_DeterministicEmbedder(8), embedding_dimension=8)
+    store.add_texts(["alpha", "beta", "gamma", "delta", "epsilon"])
+
+    # Without threshold: all five returned.
+    all_pairs = store.similarity_search_with_relevance_scores("alpha", k=5)
+    assert len(all_pairs) == 5
+
+    # With a threshold that should exclude at least the tail.
+    relevances = [s for _, s in all_pairs]
+    cutoff = sorted(relevances)[-2]  # second-highest
+    pairs = store.similarity_search_with_relevance_scores(
+        "alpha", k=5, score_threshold=cutoff
+    )
+    assert all(s >= cutoff for _, s in pairs)
+    # At most two entries can be at-or-above the second-highest.
+    assert len(pairs) <= 2
+
+
+def test_score_threshold_returns_empty_when_nothing_qualifies():
+    store = ChDBVectorStore(_DeterministicEmbedder(8), embedding_dimension=8)
+    store.add_texts(["alpha", "beta"])
+    pairs = store.similarity_search_with_relevance_scores(
+        "alpha", k=5, score_threshold=1.5
+    )
+    assert pairs == []
+
+
+async def test_async_score_threshold():
+    store = ChDBVectorStore(_DeterministicEmbedder(8), embedding_dimension=8)
+    await store.aadd_texts(["alpha", "beta", "gamma"])
+    pairs = await store.asimilarity_search_with_relevance_scores(
+        "alpha", k=3, score_threshold=2.0
+    )
+    assert pairs == []
+
+
+def test_reopen_in_same_process_via_public_api_sees_prior_writes():
+    """A second ``ChDBVectorStore`` against the same in-memory state
+    must see existing rows through the public API alone — no private
+    ``_ensure_table`` call required."""
+    s1 = ChDBVectorStore(_DeterministicEmbedder(8), embedding_dimension=8)
+    s1.add_texts(["alpha", "beta"], ids=["a", "b"])
+
+    # Fresh instance against the same ``:memory:`` (shared per process).
+    s2 = ChDBVectorStore(_DeterministicEmbedder(8), embedding_dimension=8)
+    docs = s2.get_by_ids(["a", "b"])
+    assert {d.id for d in docs} == {"a", "b"}
+
+    hits = s2.similarity_search("alpha", k=5)
+    assert {h.page_content for h in hits} == {"alpha", "beta"}
 
 
 def test_relevance_mapping_inner_product_is_sigmoid():

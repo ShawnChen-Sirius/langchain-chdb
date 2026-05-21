@@ -385,6 +385,29 @@ class ChDBVectorStore(VectorStore):
     # DDL
     # ------------------------------------------------------------------
 
+    def _table_exists_in_chdb(self) -> bool:
+        """Probe whether the backing table exists in the bound database.
+
+        Used by read methods so a freshly-instantiated store against an
+        existing on-disk database returns real rows instead of ``[]``.
+        """
+        sql = (
+            "SELECT 1 FROM system.tables "
+            "WHERE database = currentDatabase() "
+            f"AND name = {_escape_string_literal(self._table_name)} LIMIT 1"
+        )
+        return bool(self._query_jsoneachrow(sql))
+
+    def _ready_for_read(self) -> bool:
+        """Mark the table as initialized on first read against an existing
+        on-disk table; return False if the table truly doesn't exist."""
+        if self._table_initialized:
+            return True
+        if self._table_exists_in_chdb():
+            self._table_initialized = True
+            return True
+        return False
+
     def _ensure_table(self, embedding_dim: int) -> None:
         """Lazily create the backing table on the first write.
 
@@ -450,6 +473,31 @@ class ChDBVectorStore(VectorStore):
             else str(uuid.uuid4())
             for doc in documents
         ]
+
+    @staticmethod
+    def _fold_batch_by_id(
+        ids: list[str],
+        documents: list[Document],
+        embeddings: list[list[float]],
+    ) -> tuple[list[str], list[Document], list[list[float]]]:
+        """Collapse same-id rows in a single batch, keeping the last write.
+
+        ``add_documents([Document(id="1", page_content="a"),
+        Document(id="1", page_content="b")])`` must result in exactly
+        one row with content ``"b"`` — without this fold the upsert
+        would ``DELETE WHERE id IN ('1')`` once and then ``INSERT``
+        both rows, leaving the physical table with two id-equal rows
+        even if ``get_by_ids`` happened to fold them away by dict.
+        """
+        last_index: dict[str, int] = {}
+        for i, doc_id in enumerate(ids):
+            last_index[doc_id] = i
+        kept = sorted(last_index.values())
+        return (
+            [ids[i] for i in kept],
+            [documents[i] for i in kept],
+            [embeddings[i] for i in kept],
+        )
 
     def _validate_embeddings(self, embeddings: list[list[float]]) -> None:
         if not embeddings:
@@ -532,10 +580,20 @@ class ChDBVectorStore(VectorStore):
 
         if not embeddings or not embeddings[0]:
             raise ValueError("Embedder returned empty embeddings")
-        self._ensure_table(embedding_dim=len(embeddings[0]))
-        self._validate_embeddings(embeddings)
-        self._sync_delete_by_ids(resolved_ids)
-        self._insert_rows(resolved_ids, documents, embeddings)
+
+        # Fold same-id rows in this batch *before* the embedder check so
+        # the dim contract is enforced on what actually gets written.
+        folded_ids, folded_docs, folded_embs = self._fold_batch_by_id(
+            resolved_ids, documents, embeddings
+        )
+
+        self._ensure_table(embedding_dim=len(folded_embs[0]))
+        self._validate_embeddings(folded_embs)
+        self._sync_delete_by_ids(folded_ids)
+        self._insert_rows(folded_ids, folded_docs, folded_embs)
+        # Return the ids the caller passed in (preserving order and
+        # duplicates) — they map 1:1 to input documents even though the
+        # physical write collapsed.
         return resolved_ids
 
     def add_texts(
@@ -599,8 +657,7 @@ class ChDBVectorStore(VectorStore):
         """
         if not ids:
             return []
-        if not self._table_initialized:
-            # Table not yet created — nothing to return.
+        if not self._ready_for_read():
             return []
 
         in_clause = ", ".join(_escape_string_literal(i) for i in ids)
@@ -649,7 +706,7 @@ class ChDBVectorStore(VectorStore):
                 f"Query embedding has length {len(embedding)}, "
                 f"expected {self._embedding_dimension}"
             )
-        if not self._table_initialized:
+        if not self._ready_for_read():
             return []
 
         fn, _smaller_is_closer = _DISTANCE_FN[self._distance_strategy]
@@ -715,10 +772,20 @@ class ChDBVectorStore(VectorStore):
         k: int = 4,
         *,
         filter: dict[str, Any] | None = None,
+        score_threshold: float | None = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
+        """Return ``(Document, relevance)`` pairs, optionally filtered by threshold.
+
+        ``score_threshold`` is applied to the relevance score (the
+        ``[0, 1]`` value), not the raw chDB distance. Pairs with
+        relevance below the threshold are dropped from the result.
+        """
         raw = self.similarity_search_with_score(query, k=k, filter=filter)
-        return [(doc, self._raw_score_to_relevance(score)) for doc, score in raw]
+        pairs = [(doc, self._raw_score_to_relevance(score)) for doc, score in raw]
+        if score_threshold is not None:
+            pairs = [(d, s) for d, s in pairs if s >= score_threshold]
+        return pairs
 
     def _raw_score_to_relevance(self, score: float) -> float:
         """Map a strategy-specific raw score into the ``[0, 1]`` interval."""
@@ -825,10 +892,15 @@ class ChDBVectorStore(VectorStore):
         k: int = 4,
         *,
         filter: dict[str, Any] | None = None,
+        score_threshold: float | None = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
         return await asyncio.to_thread(
-            self.similarity_search_with_relevance_scores, query, k, filter=filter
+            self.similarity_search_with_relevance_scores,
+            query,
+            k,
+            filter=filter,
+            score_threshold=score_threshold,
         )
 
     async def asimilarity_search_by_vector(
