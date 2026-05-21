@@ -224,12 +224,12 @@ def test_reopen_via_public_api_sees_prior_writes():
 
 
 def test_insertion_order_preserved_when_all_ts_collide(monkeypatch):
-    """If every ``add_messages`` call observes the same ``time.time()``,
-    the ``seq`` tie-breaker must still recover insertion order on read.
+    """Even when every ``add_messages`` call observes the same wall-clock
+    ``time.time()``, the persistent ``seq`` counter must recover
+    insertion order on read.
 
     Reproduces the reviewer's case: five sequential single-message
-    writes against a clock frozen at one instant. Without ``seq`` the
-    read order is undefined; with ``seq`` it equals insertion order.
+    writes against a clock frozen at one instant.
     """
     import langchain_chdb.chat_message_histories as cmh_module
 
@@ -243,6 +243,51 @@ def test_insertion_order_preserved_when_all_ts_collide(monkeypatch):
     assert contents == ["0", "1", "2", "3", "4"], (
         f"insertion order lost under same-ts collision: {contents!r}"
     )
+
+
+def test_clock_rewind_does_not_reorder_history(monkeypatch):
+    """The ``seq`` column is the canonical insertion-order key — a
+    clock rewind between writes (NTP correction, manual adjustment,
+    DST regression) must NOT reorder previously-written messages.
+
+    Reproduces the reviewer's case: ``first`` is written at one
+    wall-clock instant, then the clock jumps backward, then
+    ``second`` is written. The read order must still be
+    ``['first', 'second']``.
+    """
+    import itertools as _it
+
+    import langchain_chdb.chat_message_histories as cmh_module
+
+    # Each call to time.time() returns a smaller value than the previous one.
+    clocks = _it.chain(
+        [1_700_000_000.0, 1_500_000_000.0],
+        _it.repeat(1_500_000_000.0),
+    )
+    monkeypatch.setattr(cmh_module.time, "time", lambda: next(clocks))
+
+    h = ChDBChatMessageHistory(session_id="rewind")
+    h.add_messages([HumanMessage("first")])
+    h.add_messages([HumanMessage("second")])
+
+    contents = [m.content for m in h.messages]
+    assert contents == ["first", "second"], (
+        f"clock rewind reordered the history: {contents!r}"
+    )
+
+
+def test_clear_then_add_resets_seq_correctly():
+    """After ``clear()``, the session's stored rows are gone, so
+    ``max(seq)`` becomes 0 (empty result) and the next write starts
+    at seq=1 again. Insertion order in the new conversation must be
+    correct."""
+    h = ChDBChatMessageHistory(session_id="reset")
+    h.add_messages([HumanMessage("old-1"), HumanMessage("old-2")])
+    h.clear()
+    assert h.messages == []
+    h.add_messages([HumanMessage("new-1"), HumanMessage("new-2")])
+    contents = [m.content for m in h.messages]
+    assert contents == ["new-1", "new-2"]
 
 
 # ---------------------------------------------------------------------------
