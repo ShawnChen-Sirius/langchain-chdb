@@ -1,0 +1,105 @@
+name: Publish
+
+# Tag-triggered automatic release flow:
+#
+#   git tag v0.1.0 && git push upstream v0.1.0
+#     ↓
+#   workflow runs: build → twine check → twine upload (OIDC) → gh release upload
+#     ↓
+#   pip install langchain-chdb==0.1.0 works globally
+#
+# Authentication: PyPI Trusted Publishing (OIDC). The chdb-io org must
+# register the pending publisher once at
+# https://pypi.org/manage/account/publishing/ with:
+#
+#   PyPI Project Name:  langchain-chdb
+#   Owner:              chdb-io
+#   Repository name:    langchain-chdb
+#   Workflow filename:  publish.yml
+#   Environment name:   pypi
+#
+# After the first successful publish PyPI binds the project to this
+# workflow + environment. No PYPI_API_TOKEN secret is needed and none
+# should be configured.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (e.g., v0.1.0). Must already exist.'
+        required: true
+
+permissions:
+  contents: write   # for GitHub Release creation + asset upload
+  id-token: write   # for PyPI Trusted Publishing OIDC token issuance
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to PyPI + GitHub Release
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/langchain-chdb/
+    steps:
+      - name: Checkout at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Resolve tag → version and verify pyproject.toml match
+        id: ver
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+
+          PYPROJECT_VERSION=$(grep -E '^version = ' pyproject.toml | sed -E 's/version = "(.+)"/\1/')
+          if [ "$VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::Tag version '$VERSION' does not match pyproject.toml version '$PYPROJECT_VERSION'. Refusing to publish."
+            exit 1
+          fi
+          echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"  >> "$GITHUB_OUTPUT"
+          echo "Tag '$TAG' (version $VERSION) matches pyproject.toml. Proceeding."
+
+      - name: Build wheel + sdist
+        run: uv build
+
+      - name: Validate distributions
+        run: uv run --with twine twine check dist/*
+
+      - name: Publish to PyPI via Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # OIDC: no username / password / token configured.
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --notes "Automated release — see CHANGELOG for the v${{ steps.ver.outputs.version }} entry. Published to https://pypi.org/project/langchain-chdb/${{ steps.ver.outputs.version }}/."
+          fi
+          gh release upload "$TAG" dist/* \
+            --repo "${{ github.repository }}" \
+            --clobber
