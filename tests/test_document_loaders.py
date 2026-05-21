@@ -151,6 +151,53 @@ def test_array_column_preserves_list_type(array_parquet):
 
 
 # ---------------------------------------------------------------------------
+# column validation — bad column names fail loudly, not silently
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_page_content_column_raises_value_error(docs_parquet):
+    loader = ChDBLoader(
+        query=f"SELECT id, body FROM file('{docs_parquet}', 'Parquet')",
+        page_content_columns=["typo"],
+    )
+    with pytest.raises(ValueError, match=r"page_content_columns.*'typo'"):
+        loader.load()
+
+
+def test_unknown_metadata_column_raises_value_error(docs_parquet):
+    loader = ChDBLoader(
+        query=f"SELECT id, body FROM file('{docs_parquet}', 'Parquet')",
+        metadata_columns=["typo"],
+    )
+    with pytest.raises(ValueError, match=r"metadata_columns.*'typo'"):
+        loader.load()
+
+
+def test_partial_unknown_in_multi_column_page_content_raises(docs_parquet):
+    """One valid column + one typo'd column must still raise — the multi-
+    column path used to silently skip missing keys."""
+    loader = ChDBLoader(
+        query=f"SELECT id, body FROM file('{docs_parquet}', 'Parquet')",
+        page_content_columns=["body", "nope"],
+    )
+    with pytest.raises(ValueError, match=r"page_content_columns.*'nope'"):
+        loader.load()
+
+
+def test_validation_skipped_on_empty_result(tmp_path):
+    """No rows = nothing to validate against. The loader returns ``[]``
+    rather than raising — bad column names are caught when there is at
+    least one row to compare against. Documented as a deliberate gap."""
+    p = tmp_path / "empty.parquet"
+    pd.DataFrame({"id": [1]}).to_parquet(p)
+    loader = ChDBLoader(
+        query=f"SELECT id FROM file('{p}', 'Parquet') WHERE id < 0",
+        page_content_columns=["typo"],
+    )
+    assert loader.load() == []
+
+
+# ---------------------------------------------------------------------------
 # async parity
 # ---------------------------------------------------------------------------
 

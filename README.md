@@ -22,25 +22,7 @@ pip install langchain-chdb
 pip install "langchain-chdb[sql]"
 ```
 
-## Components
-
-### `ChDBVectorStore`
-
-```python
-from langchain_chdb import ChDBVectorStore
-from langchain_openai import OpenAIEmbeddings
-
-store = ChDBVectorStore.from_texts(
-    texts=["chDB is an embedded ClickHouse.", "It runs SQL on local files."],
-    embedding=OpenAIEmbeddings(),
-    embedding_dimension=1536,
-    database="./chdb-store",
-)
-
-results = store.similarity_search("which engine embeds ClickHouse?", k=1)
-```
-
-Backed by `Array(Float32)` columns and the ClickHouse vector-distance functions. The constructor short alias `ChDB = ChDBVectorStore` is exported for brevity.
+## Available now
 
 ### `ChDBLoader`
 
@@ -48,30 +30,14 @@ Backed by `Array(Float32)` columns and the ClickHouse vector-distance functions.
 from langchain_chdb import ChDBLoader
 
 loader = ChDBLoader(
-    query="SELECT title, body FROM file('articles.parquet')",
+    query="SELECT title, body FROM file('articles.parquet', 'Parquet')",
     page_content_columns=["body"],
     metadata_columns=["title"],
 )
 docs = loader.load()
 ```
 
-A single-column `page_content_columns` returns the raw cell as `Document.page_content`; multi-column or `None` serializes the listed columns as `col: value` lines. See [`docs/decisions/loader_page_content_format.md`](docs/decisions/loader_page_content_format.md) for the rationale.
-
-### `ChDBChatMessageHistory`
-
-```python
-from langchain_chdb import ChDBChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
-
-history = ChDBChatMessageHistory(session_id="abc", database="./chats.chdb")
-history.add_message(HumanMessage("Hello"))
-history.add_message(AIMessage("Hi!"))
-
-for m in history.messages:
-    print(type(m).__name__, m.content)
-```
-
-Implements `BaseChatMessageHistory`. Sessions are strictly isolated by `session_id`. Compose with `ChDBVectorStore.as_retriever()` and `RunnableWithMessageHistory` for retrieval-augmented chat.
+A single-column `page_content_columns` returns the raw cell as `Document.page_content`; multi-column or `None` serializes the listed columns as `col: value` lines. Bad column names raise `ValueError` on first row. See [`docs/decisions/loader_page_content_format.md`](docs/decisions/loader_page_content_format.md) for the rationale.
 
 ### SQLDatabaseToolkit integration
 
@@ -88,6 +54,43 @@ toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 ```
 
 The chdb-sqlalchemy dialect handles reflection, type mapping, and the introspection contract that `SQLDatabaseToolkit` depends on.
+
+## In progress — landing in 0.1.0
+
+The classes below are part of the 0.1.0 surface and are landing
+incrementally. They are **not yet exported**; the snippets are a preview
+of the planned API, not runnable on `0.1.0a*`.
+
+### `ChDBVectorStore` (planned)
+
+```text
+# Preview — landing in 0.1.0, not yet importable on 0.1.0a*:
+# from langchain_chdb import ChDBVectorStore
+#
+# store = ChDBVectorStore.from_texts(
+#     texts=["chDB is an embedded ClickHouse.", "It runs SQL on local files."],
+#     embedding=OpenAIEmbeddings(),
+#     embedding_dimension=1536,
+#     database="./chdb-store",
+# )
+# results = store.similarity_search("which engine embeds ClickHouse?", k=1)
+```
+
+Backed by `Array(Float32)` columns and the ClickHouse vector-distance functions (`cosineDistance` / `L2Distance` / `dotProduct`). The constructor short alias `ChDB = ChDBVectorStore` will be exported for brevity. LangChain's `VectorStoreIntegrationTests` is the gating contract for the implementation.
+
+### `ChDBChatMessageHistory` (planned)
+
+```text
+# Preview — landing in 0.1.0, not yet importable on 0.1.0a*:
+# from langchain_chdb import ChDBChatMessageHistory
+# from langchain_core.messages import HumanMessage, AIMessage
+#
+# history = ChDBChatMessageHistory(session_id="abc", database="./chats.chdb")
+# history.add_message(HumanMessage("Hello"))
+# history.add_message(AIMessage("Hi!"))
+```
+
+Will implement `BaseChatMessageHistory`. Sessions are strictly isolated by `session_id`. The recommended retrieval-augmented chat pattern in LangChain 1.x is to compose `ChDBVectorStore.as_retriever()` with `RunnableWithMessageHistory(ChDBChatMessageHistory)` rather than to wrap them in a `BaseMemory` subclass.
 
 ## Reference architecture
 
