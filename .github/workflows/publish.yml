@@ -4,23 +4,23 @@ name: Publish
 #
 #   git tag v0.1.0 && git push upstream v0.1.0
 #     ↓
-#   workflow runs: build → twine check → twine upload (OIDC) → gh release upload
+#   workflow runs: build → twine check → twine upload → gh release upload
 #     ↓
 #   pip install langchain-chdb==0.1.0 works globally
 #
-# Authentication: PyPI Trusted Publishing (OIDC). The chdb-io org must
-# register the pending publisher once at
-# https://pypi.org/manage/account/publishing/ with:
+# Authentication: project-scoped PyPI API token stored as a repo secret.
+# One-time external setup required before the first tag push:
 #
-#   PyPI Project Name:  langchain-chdb
-#   Owner:              chdb-io
-#   Repository name:    langchain-chdb
-#   Workflow filename:  publish.yml
-#   Environment name:   pypi
-#
-# After the first successful publish PyPI binds the project to this
-# workflow + environment. No PYPI_API_TOKEN secret is needed and none
-# should be configured.
+# 1. Generate a project-scoped API token at
+#    https://pypi.org/manage/account/token/ — Scope: "Project: langchain-chdb"
+#    (or, before the project exists on PyPI, an account-wide token used
+#    once for the very first upload; rotate to project-scoped afterwards).
+# 2. Add the token as repo secret PYPI_API_TOKEN at
+#    https://github.com/chdb-io/langchain-chdb/settings/secrets/actions/new
+# 3. (Optional but recommended) Create environment "pypi" at
+#    https://github.com/chdb-io/langchain-chdb/settings/environments and
+#    attach a required-reviewer protection rule. The token can also be
+#    moved into the environment scope (takes precedence over repo scope).
 
 on:
   push:
@@ -33,7 +33,6 @@ on:
 
 permissions:
   contents: write   # for GitHub Release creation + asset upload
-  id-token: write   # for PyPI Trusted Publishing OIDC token issuance
 
 concurrency:
   group: publish-${{ github.ref }}
@@ -85,9 +84,11 @@ jobs:
       - name: Validate distributions
         run: uv run --with twine twine check dist/*
 
-      - name: Publish to PyPI via Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
-        # OIDC: no username / password / token configured.
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv run --with twine twine upload dist/*
 
       - name: Create or update GitHub Release
         env:
