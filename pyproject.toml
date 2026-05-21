@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-chdb"
-version = "0.1.0a0"
+version = "0.1.0"
 description = "LangChain provider for chDB — vector store, document loader, chat history, and SQL backend for LangChain agents. In-process OLAP with native vectors and federation to remote ClickHouse."
 readme = "README.md"
 requires-python = ">=3.10"

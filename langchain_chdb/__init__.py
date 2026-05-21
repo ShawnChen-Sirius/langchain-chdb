@@ -23,7 +23,7 @@ from langchain_chdb.chat_message_histories import ChDBChatMessageHistory
 from langchain_chdb.document_loaders import ChDBLoader
 from langchain_chdb.vectorstores import ChDB, ChDBVectorStore, DistanceStrategy
 
-__version__ = "0.1.0a0"
+__version__ = "0.1.0"
 
 __all__ = [
     "ChDB",
