@@ -11,8 +11,13 @@ Coverage:
 * ``clear()`` removes only the current session's messages.
 * ``messages`` returns rows in insertion order.
 * Async (``aadd_messages`` / ``aget_messages`` / ``aclear``) parity with sync.
-* Reopening an instance against an existing on-disk database reads back
-  prior writes via the public API alone.
+* Insertion order is preserved even when all messages collide on the
+  wall-clock ``ts`` (the ``seq`` tie-breaker recovers order).
+* Reopening an instance against a shared ``:memory:`` reads back prior
+  writes via the public API alone (in-process case).
+* Reopening an instance against an on-disk database file reads back
+  prior writes via the public API alone (file-backed case, exercised
+  in a subprocess to dodge chDB's process-global ``EmbeddedServer``).
 """
 
 from __future__ import annotations
@@ -211,3 +216,80 @@ def test_reopen_via_public_api_sees_prior_writes():
     s2 = ChDBChatMessageHistory(session_id="persistent")
     msgs = s2.messages
     assert [m.content for m in msgs] == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# tie-break ordering — same ts, different seq
+# ---------------------------------------------------------------------------
+
+
+def test_insertion_order_preserved_when_all_ts_collide(monkeypatch):
+    """If every ``add_messages`` call observes the same ``time.time()``,
+    the ``seq`` tie-breaker must still recover insertion order on read.
+
+    Reproduces the reviewer's case: five sequential single-message
+    writes against a clock frozen at one instant. Without ``seq`` the
+    read order is undefined; with ``seq`` it equals insertion order.
+    """
+    import langchain_chdb.chat_message_histories as cmh_module
+
+    monkeypatch.setattr(cmh_module.time, "time", lambda: 1_700_000_000.0)
+
+    h = ChDBChatMessageHistory(session_id="s_tie")
+    for i in range(5):
+        h.add_messages([HumanMessage(str(i))])
+
+    contents = [m.content for m in h.messages]
+    assert contents == ["0", "1", "2", "3", "4"], (
+        f"insertion order lost under same-ts collision: {contents!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# file-backed reopen — subprocess so the chDB process-global
+# EmbeddedServer path can be bound cleanly
+# ---------------------------------------------------------------------------
+
+
+def test_file_backed_reopen_round_trip(tmp_path):
+    """Write to a file-backed history, close, reopen the same path in
+    a fresh process, read the messages back. chDB binds its
+    ``EmbeddedServer`` once per process to whichever path is opened
+    first — other tests in this file use ``:memory:``, so the on-disk
+    round-trip has to run inside a subprocess to get a clean init.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    db = tmp_path / "chat.chdb"
+    code = textwrap.dedent(f"""
+        from langchain_core.messages import HumanMessage, AIMessage
+        from langchain_chdb import ChDBChatMessageHistory
+
+        # Phase 1: write two messages, close.
+        s1 = ChDBChatMessageHistory(session_id='persist', database={str(db)!r})
+        s1.add_messages([HumanMessage('disk-a'), AIMessage('disk-b')])
+        s1.close()
+
+        # Phase 2: fresh instance, SAME path, public API only.
+        s2 = ChDBChatMessageHistory(session_id='persist', database={str(db)!r})
+        msgs = s2.messages
+        assert len(msgs) == 2, f"expected 2 messages, got {{len(msgs)}}"
+        contents = [m.content for m in msgs]
+        assert contents == ['disk-a', 'disk-b'], f"got {{contents!r}}"
+        types = [type(m).__name__ for m in msgs]
+        assert types == ['HumanMessage', 'AIMessage'], f"got {{types!r}}"
+        s2.close()
+        print('DISK_REOPEN_OK')
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"subprocess failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "DISK_REOPEN_OK" in result.stdout

@@ -8,19 +8,25 @@ Each store maps to one chDB table::
     CREATE TABLE {table_name} (
         session_id String,
         ts         DateTime64(6),
+        seq        UInt64,
         role       LowCardinality(String),
         payload    JSON
     )
     ENGINE = MergeTree()
-    ORDER BY (session_id, ts);
+    ORDER BY (session_id, ts, seq);
 
 * ``session_id`` partitions histories by conversation. Reads, writes,
   and ``clear()`` are all scoped to one ``session_id``; the schema
-  enforces that by ordering the table on ``(session_id, ts)`` so a
-  session lookup is a contiguous range scan.
-* ``ts DateTime64(6)`` carries a microsecond timestamp per message.
-  Insert order = ``ts`` order, so the ``ORDER BY ts`` read returns
-  messages in the order they were added.
+  enforces that by ordering the table on ``(session_id, ts, seq)`` so
+  a session lookup is a contiguous range scan.
+* ``ts DateTime64(6)`` is a wall-clock timestamp per message. Useful
+  for time-range queries and human-facing display.
+* ``seq UInt64`` is a process-wide monotonically increasing counter
+  drawn from ``itertools.count()``. It guarantees a strict ordering
+  even when several ``add_messages`` calls collide on ``ts`` (chDB
+  microsecond resolution can quantize back-to-back inserts to the
+  same value). ``ORDER BY (ts, seq)`` recovers insertion order
+  unambiguously.
 * ``role`` is the LangChain ``BaseMessage.type`` (``human`` / ``ai`` /
   ``system`` / ``tool`` / ``chat`` / ``function``). Denormalized from
   the payload so SQL filtering and aggregation are cheap.
@@ -28,6 +34,11 @@ Each store maps to one chDB table::
   reconstruct the original ``BaseMessage`` subclass via
   ``messages_from_dict``, which preserves type-specific fields like
   ``ToolMessage.tool_call_id`` and ``AIMessage.tool_calls``.
+
+The ``seq`` counter is process-wide. Two writers in the same Python
+process never collide; two writers in different processes against the
+same on-disk database can — chDB itself does not guard against
+concurrent writers either, and that scenario is out of scope for v0.1.
 
 The recommended retrieval-augmented chat pattern in LangChain 1.x is to
 compose ``ChDBVectorStore.as_retriever()`` with
@@ -47,10 +58,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import re
 import time
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, ClassVar
 
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
@@ -83,6 +96,12 @@ def _format_json_literal(value: Any) -> str:
 class ChDBChatMessageHistory(BaseChatMessageHistory):
     """LangChain ``BaseChatMessageHistory`` backed by chDB.
 
+    The ``_seq_counter`` is a process-wide, monotonically increasing
+    sequence used to break ties on the wall-clock ``ts`` column at the
+    storage layer. It is shared across every ``ChDBChatMessageHistory``
+    instance in the process so any interleaving of writes still has a
+    well-defined total order.
+
     Parameters
     ----------
     session_id:
@@ -102,6 +121,11 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
         write if it doesn't exist. ``False`` is the right setting when
         the schema is managed externally.
     """
+
+    # Process-wide monotonic counter used as the storage-layer
+    # tie-breaker for the ``ts`` column. Starts at 1 so 0 is a valid
+    # "no seq yet" sentinel for any caller that needs it.
+    _seq_counter: ClassVar[Iterator[int]] = itertools.count(1)
 
     def __init__(
         self,
@@ -177,9 +201,10 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
             f"CREATE TABLE IF NOT EXISTS {_quote_identifier(self._table_name)} (\n"
             f"    session_id String,\n"
             f"    ts DateTime64(6),\n"
+            f"    seq UInt64,\n"
             f"    role LowCardinality(String),\n"
             f"    payload JSON\n"
-            f") ENGINE = MergeTree() ORDER BY (session_id, ts)"
+            f") ENGINE = MergeTree() ORDER BY (session_id, ts, seq)"
         )
         self._get_session().query(ddl)
         self._table_initialized = True
@@ -191,27 +216,35 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
     def add_messages(self, messages: list[BaseMessage]) -> None:
         """Append messages to the current session.
 
-        Timestamps are assigned at write time using monotonic-with-tie-break
-        microsecond resolution so a batch added back-to-back preserves the
-        list order in subsequent reads.
+        Each message gets a wall-clock ``ts`` and a strictly increasing
+        ``seq`` drawn from the process-wide counter. Read ordering is
+        ``ORDER BY ts ASC, seq ASC`` so insertion order is recovered
+        even when several ``add_messages`` calls collide on ``ts``.
         """
         if not messages:
             return
-        self._ensure_table()
 
-        rows: list[str] = []
-        now = time.time()
-        for i, msg in enumerate(messages):
+        # Validate types before opening a chDB session — bad input must
+        # not leave a half-created table.
+        for msg in messages:
             if not isinstance(msg, BaseMessage):
                 raise TypeError(
                     f"Expected BaseMessage, got {type(msg).__name__}: {msg!r}"
                 )
-            ts = now + i * 1e-6  # tie-break within the batch
+
+        self._ensure_table()
+
+        rows: list[str] = []
+        now_micro = int(time.time() * 1_000_000)
+        for i, msg in enumerate(messages):
+            ts_micro = now_micro + i  # 1-microsecond stride within the batch
+            seq = next(self._seq_counter)
             payload = message_to_dict(msg)
             rows.append(
                 "("
                 f"{_escape_string_literal(self._session_id)}, "
-                f"fromUnixTimestamp64Micro({int(ts * 1_000_000)}), "
+                f"fromUnixTimestamp64Micro({ts_micro}), "
+                f"{seq}, "
                 f"{_escape_string_literal(msg.type)}, "
                 f"{_format_json_literal(payload)}"
                 ")"
@@ -219,7 +252,7 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
 
         self._get_session().query(
             f"INSERT INTO {_quote_identifier(self._table_name)} "
-            "(session_id, ts, role, payload) VALUES "
+            "(session_id, ts, seq, role, payload) VALUES "
             + ",\n".join(rows)
         )
 
@@ -246,7 +279,7 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
         rows = self._query_jsoneachrow(
             f"SELECT payload FROM {_quote_identifier(self._table_name)} "
             f"WHERE session_id = {_escape_string_literal(self._session_id)} "
-            "ORDER BY ts ASC"
+            "ORDER BY ts ASC, seq ASC"
         )
         if not rows:
             return []
