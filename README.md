@@ -4,7 +4,7 @@
 
 `langchain-chdb` lets you use chDB as a vector store, document loader, chat-history store, and SQL backend for LangChain agents. Everything runs in the agent's own process; no server to operate. Federation to remote ClickHouse Cloud clusters is available through chDB's `remoteSecure()` table function.
 
-> Status: pre-release. The v0.1 public surface — `ChDBLoader`, `ChDBVectorStore` (and `ChDB` short alias), `ChDBChatMessageHistory`, `DistanceStrategy` — is complete in `main` and reaches PyPI on the v0.1.0 tag.
+> Status: v0.1.0 — first stable release. Public surface: `ChDBLoader`, `ChDBVectorStore` (with `ChDB` short alias and `DistanceStrategy`), `ChDBChatMessageHistory`. Installable via `pip install langchain-chdb`.
 
 ## What this gives you
 
@@ -56,7 +56,7 @@ store = ChDBVectorStore.from_texts(
 results = store.similarity_search("which engine embeds ClickHouse?", k=1)
 ```
 
-Backed by an `Array(Float32)` column with a `length(embedding) = N` `CHECK` constraint, indexed with `MergeTree() ORDER BY id`. Supports `DistanceStrategy.COSINE` / `EUCLIDEAN` / `MAX_INNER_PRODUCT`, a whitelist metadata-filter DSL (`$in`, `$gt`/`$gte`/`$lt`/`$lte`/`$ne`, `$and`/`$or`/`$not`), idempotent upsert via `DELETE WHERE id IN (...) SETTINGS mutations_sync = 1` then `INSERT`, and `score_threshold` filtering on relevance. Passes LangChain's full `VectorStoreIntegrationTests` conformance suite. The short alias `ChDB = ChDBVectorStore` is exported for brevity.
+Backed by an `Array(Float32)` column with a `length(embedding) = N` `CHECK` constraint, stored in a `MergeTree` table sorted by `id` (sort key — not a uniqueness constraint, see [`docs/decisions/storage_dedup.md`](docs/decisions/storage_dedup.md)). Supports `DistanceStrategy.COSINE` / `EUCLIDEAN` / `MAX_INNER_PRODUCT`, a whitelist metadata-filter DSL (`$in`, `$gt`/`$gte`/`$lt`/`$lte`/`$ne`, `$and`/`$or`/`$not`), idempotent upsert via `DELETE WHERE id IN (...) SETTINGS mutations_sync = 1` then `INSERT`, and `score_threshold` filtering on relevance. Passes LangChain's full `VectorStoreIntegrationTests` conformance suite. The short alias `ChDB = ChDBVectorStore` is exported for brevity.
 
 ### `ChDBChatMessageHistory`
 
@@ -72,6 +72,8 @@ for m in history.messages:
 ```
 
 Implements `BaseChatMessageHistory` with `(session_id, seq)`-ordered `MergeTree` storage. The `seq UInt64` column is the canonical insertion-order key — assigned per session as `max(seq) + 1` at write time, immune to wall-clock movement (NTP corrections, manual adjustments, DST rollover). Sessions are strictly isolated; every read, write, and `clear()` is scoped to one `session_id`. All four core message types (`HumanMessage` / `AIMessage` / `SystemMessage` / `ToolMessage`) round-trip with type and content preserved, plus type-specific fields like `ToolMessage.tool_call_id` and `additional_kwargs`. The recommended retrieval-augmented chat pattern in LangChain 1.x is to compose `ChDBVectorStore.as_retriever()` with `RunnableWithMessageHistory(ChDBChatMessageHistory)` rather than to wrap them in a `BaseMemory` subclass.
+
+> **Concurrency note.** The `max(seq) + 1` write protocol assumes a single writer per `session_id`. Two threads in the same Python process — or two separate processes against the same on-disk database — can race the `max(seq)` read and produce duplicate `seq` values. chDB itself does not guard against concurrent writers; multi-writer safety is out of scope for v0.1.
 
 ### SQLDatabaseToolkit integration
 

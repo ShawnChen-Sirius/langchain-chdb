@@ -29,7 +29,8 @@ document loader, chat-message history store, and SQL backend.
 
 - **`ChDBVectorStore`** (with `ChDB` short alias) — `VectorStore` backed by an
   `Array(Float32)` column with a `length(embedding) = N` `CHECK` constraint,
-  indexed with `MergeTree() ORDER BY id`. Passes the full
+  stored in a `MergeTree` table sorted by `id` (sort key, not a uniqueness
+  constraint — see the storage-dedup decision record). Passes the full
   `langchain_tests.integration_tests.vectorstores.VectorStoreIntegrationTests`
   conformance suite. Features:
 
@@ -63,6 +64,12 @@ document loader, chat-message history store, and SQL backend.
   `additional_kwargs`, and `tool_call_id` preserved. Sessions are strictly
   isolated — every read, write, and `clear()` is scoped to one `session_id`.
   Full sync + async parity (`aadd_messages`, `aget_messages`, `aclear`).
+
+  The `max(seq) + 1` write protocol assumes a **single writer per
+  session_id**. Two threads in the same Python process — or two separate
+  processes against the same on-disk database — can race the `max(seq)`
+  read and produce duplicate `seq` values. Multi-writer safety is out of
+  scope for v0.1.
 
   *Not* a `BaseMemory` subclass: classic memory is deprecated in
   LangChain 1.x. Compose `ChDBVectorStore.as_retriever()` with
