@@ -58,6 +58,21 @@ results = store.similarity_search("which engine embeds ClickHouse?", k=1)
 
 Backed by an `Array(Float32)` column with a `length(embedding) = N` `CHECK` constraint, indexed with `MergeTree() ORDER BY id`. Supports `DistanceStrategy.COSINE` / `EUCLIDEAN` / `MAX_INNER_PRODUCT`, a whitelist metadata-filter DSL (`$in`, `$gt`/`$gte`/`$lt`/`$lte`/`$ne`, `$and`/`$or`/`$not`), idempotent upsert via `DELETE WHERE id IN (...) SETTINGS mutations_sync = 1` then `INSERT`, and `score_threshold` filtering on relevance. Passes LangChain's full `VectorStoreIntegrationTests` conformance suite. The short alias `ChDB = ChDBVectorStore` is exported for brevity.
 
+### `ChDBChatMessageHistory`
+
+```python
+from langchain_chdb import ChDBChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
+
+history = ChDBChatMessageHistory(session_id="abc", database="./chats.chdb")
+history.add_messages([HumanMessage("Hello"), AIMessage("Hi!")])
+
+for m in history.messages:
+    print(type(m).__name__, m.content)
+```
+
+Implements `BaseChatMessageHistory` with `(session_id, ts)`-ordered `MergeTree` storage. Sessions are strictly isolated — every read, write, and `clear()` is scoped to one `session_id`. All four core message types (`HumanMessage` / `AIMessage` / `SystemMessage` / `ToolMessage`) round-trip with type and content preserved, plus type-specific fields like `ToolMessage.tool_call_id` and `additional_kwargs`. The recommended retrieval-augmented chat pattern in LangChain 1.x is to compose `ChDBVectorStore.as_retriever()` with `RunnableWithMessageHistory(ChDBChatMessageHistory)` rather than to wrap them in a `BaseMemory` subclass.
+
 ### SQLDatabaseToolkit integration
 
 chDB plugs into LangChain's `SQLDatabaseToolkit` through the [`chdb-sqlalchemy`](https://github.com/chdb-io/chdb-sqlalchemy) dialect, exposed under the `[sql]` extra:
@@ -73,26 +88,6 @@ toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 ```
 
 The chdb-sqlalchemy dialect handles reflection, type mapping, and the introspection contract that `SQLDatabaseToolkit` depends on.
-
-## In progress — landing in 0.1.0
-
-The class below is part of the 0.1.0 surface and is landing next. It is
-**not yet exported**; the snippet is a preview of the planned API, not
-runnable on the current pre-release.
-
-### `ChDBChatMessageHistory` (planned)
-
-```text
-# Preview — landing in 0.1.0, not yet importable on 0.1.0a*:
-# from langchain_chdb import ChDBChatMessageHistory
-# from langchain_core.messages import HumanMessage, AIMessage
-#
-# history = ChDBChatMessageHistory(session_id="abc", database="./chats.chdb")
-# history.add_message(HumanMessage("Hello"))
-# history.add_message(AIMessage("Hi!"))
-```
-
-Will implement `BaseChatMessageHistory`. Sessions are strictly isolated by `session_id`. The recommended retrieval-augmented chat pattern in LangChain 1.x is to compose `ChDBVectorStore.as_retriever()` with `RunnableWithMessageHistory(ChDBChatMessageHistory)` rather than to wrap them in a `BaseMemory` subclass.
 
 ## Reference architecture
 
