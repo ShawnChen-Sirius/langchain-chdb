@@ -4,7 +4,7 @@
 
 `langchain-chdb` lets you use chDB as a vector store, document loader, chat-history store, and SQL backend for LangChain agents. Everything runs in the agent's own process; no server to operate. Federation to remote ClickHouse Cloud clusters is available through chDB's `remoteSecure()` table function.
 
-> Status: 0.1.0a0 scaffolding. Public classes (`ChDBLoader`, `ChDBVectorStore`, `ChDBChatMessageHistory`) land incrementally per the v0.1 execution plan and are available in 0.1.0.
+> Status: pre-release. The v0.1 public surface — `ChDBLoader`, `ChDBVectorStore` (and `ChDB` short alias), `ChDBChatMessageHistory`, `DistanceStrategy` — is complete in `main` and reaches PyPI on the v0.1.0 tag.
 
 ## What this gives you
 
@@ -71,7 +71,7 @@ for m in history.messages:
     print(type(m).__name__, m.content)
 ```
 
-Implements `BaseChatMessageHistory` with `(session_id, ts)`-ordered `MergeTree` storage. Sessions are strictly isolated — every read, write, and `clear()` is scoped to one `session_id`. All four core message types (`HumanMessage` / `AIMessage` / `SystemMessage` / `ToolMessage`) round-trip with type and content preserved, plus type-specific fields like `ToolMessage.tool_call_id` and `additional_kwargs`. The recommended retrieval-augmented chat pattern in LangChain 1.x is to compose `ChDBVectorStore.as_retriever()` with `RunnableWithMessageHistory(ChDBChatMessageHistory)` rather than to wrap them in a `BaseMemory` subclass.
+Implements `BaseChatMessageHistory` with `(session_id, seq)`-ordered `MergeTree` storage. The `seq UInt64` column is the canonical insertion-order key — assigned per session as `max(seq) + 1` at write time, immune to wall-clock movement (NTP corrections, manual adjustments, DST rollover). Sessions are strictly isolated; every read, write, and `clear()` is scoped to one `session_id`. All four core message types (`HumanMessage` / `AIMessage` / `SystemMessage` / `ToolMessage`) round-trip with type and content preserved, plus type-specific fields like `ToolMessage.tool_call_id` and `additional_kwargs`. The recommended retrieval-augmented chat pattern in LangChain 1.x is to compose `ChDBVectorStore.as_retriever()` with `RunnableWithMessageHistory(ChDBChatMessageHistory)` rather than to wrap them in a `BaseMemory` subclass.
 
 ### SQLDatabaseToolkit integration
 
@@ -87,7 +87,7 @@ db = SQLDatabase(engine)
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 ```
 
-The chdb-sqlalchemy dialect handles reflection, type mapping, and the introspection contract that `SQLDatabaseToolkit` depends on.
+The chdb-sqlalchemy dialect handles reflection, type mapping, and the introspection contract that `SQLDatabaseToolkit` depends on. A worked end-to-end example with LangGraph + Claude lives at [`docs/cookbook/text_to_sql_with_langgraph.ipynb`](docs/cookbook/text_to_sql_with_langgraph.ipynb).
 
 ## Reference architecture
 
@@ -111,15 +111,23 @@ No external services beyond what the agent already uses (LLM API, optional remot
 
 | Component | State |
 |---|---|
-| Repo scaffold, CI, publish workflow | shipped in 0.1.0a0 |
-| `ChDBLoader` | landing in 0.1.0 |
-| `ChDBVectorStore` | landing in 0.1.0 (LangChain `VectorStoreIntegrationTests` is the gating contract) |
-| `ChDBChatMessageHistory` | landing in 0.1.0 |
-| SQLDatabaseToolkit cookbook | landing in 0.1.0 |
+| Repo scaffold, CI, publish workflow | available in `main`; PyPI 0.1.0a0 |
+| `ChDBLoader` | available in `main`; on PyPI from 0.1.0 |
+| `ChDBVectorStore` (and `ChDB` short alias) | available in `main`; on PyPI from 0.1.0. Passes LangChain's `VectorStoreIntegrationTests`. |
+| `ChDBChatMessageHistory` | available in `main`; on PyPI from 0.1.0 |
+| Text-to-SQL cookbook (LangGraph + Claude) | available in `main`; runnable with `ANTHROPIC_API_KEY` |
 | ClickHouse vector-similarity ANN indexes | planned for 0.2.x |
-| `BaseMemory` adapter | not planned — composing `ChDBVectorStore.as_retriever()` + `ChDBChatMessageHistory` with `RunnableWithMessageHistory` is the recommended pattern in LangChain 1.x |
+| Append-only / `ReplacingMergeTree` vector storage | planned for 0.2.x; see [`docs/decisions/storage_dedup.md`](docs/decisions/storage_dedup.md) |
+| `BaseMemory` adapter | not planned — `ChDBVectorStore.as_retriever()` + `RunnableWithMessageHistory(ChDBChatMessageHistory)` is the recommended composition in LangChain 1.x |
 
-Detailed plan: see [docs/langchain_chdb_v0_1_plan.md](docs/langchain_chdb_v0_1_plan.md) once it lands inside the repo.
+## Decision records
+
+The trade-offs that shaped the v0.1 surface live under
+[`docs/decisions/`](docs/decisions/):
+
+- [`loader_page_content_format.md`](docs/decisions/loader_page_content_format.md) — how `ChDBLoader` builds `Document.page_content` and `Document.metadata` from a query result.
+- [`storage_dedup.md`](docs/decisions/storage_dedup.md) — why `ChDBVectorStore` v0.1 upserts via `DELETE WHERE id IN (...) SETTINGS mutations_sync = 1` + `INSERT`, and the v0.2 plan to migrate to append-only / versioned dedup.
+- [`score_semantics.md`](docs/decisions/score_semantics.md) — how the three `DistanceStrategy` values map raw chDB distances into the `[0, 1]` LangChain relevance interval.
 
 ## License
 
