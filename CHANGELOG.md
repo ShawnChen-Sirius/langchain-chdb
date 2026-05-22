@@ -10,6 +10,34 @@ First public release. The `langchain-chdb` package brings chDB — the in-proces
 OLAP SQL engine powered by ClickHouse — to LangChain agents as a vector store,
 document loader, chat-message history store, and SQL backend.
 
+### Positioning
+
+This release targets the LangChain-agent workflow where one engine handles
+**retrieval, structured filters, chat state, and analytical SQL** without
+spinning up a separate service:
+
+- **Embedded ClickHouse for LangChain agents.** The same SQL dialect runs in
+  local notebooks, CI fixtures, edge jobs, and agent sandboxes, then carries
+  over unchanged to ClickHouse Server or ClickHouse Cloud.
+- **SQL-shaped document loading.** chDB's table functions — `file()`,
+  `s3()`, `url()`, `remoteSecure()` — let `ChDBLoader` turn Parquet, CSV,
+  JSON, S3 objects, URLs, and remote ClickHouse tables into LangChain
+  `Document` objects with `SELECT` / `WHERE` / `JOIN` / `GROUP BY` /
+  `LIMIT` applied before embedding.
+- **Agent event and JSON analytics in the same store.** Tool-call payloads,
+  trace events, session metadata, and retrieval metadata live in
+  `MergeTree` tables alongside the vector and chat-history surfaces, and
+  are queryable with typed JSON paths plus analytical aggregates.
+- **Exact vector retrieval composed with SQL filters.** v0.1 uses
+  `Array(Float32)` embeddings and the chDB scalar distance functions
+  (`cosineDistance`, `L2Distance`, `dotProduct`) for exact search. **No
+  ANN indexes** in v0.1 — ClickHouse vector-similarity ANN indexes are
+  planned for the 0.2 series.
+- **Local-to-Cloud workflow.** The same agent can read a local Parquet
+  file, persist intermediate state to a file-backed chDB store, and
+  `JOIN` either against a warehouse-scale ClickHouse Cloud cluster via
+  `remoteSecure()` — all inside one process and one SQL query.
+
 ### Added
 
 - **`ChDBLoader`** — `BaseLoader` that turns any chDB SQL query into LangChain
