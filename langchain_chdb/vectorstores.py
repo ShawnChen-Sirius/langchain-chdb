@@ -76,6 +76,8 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 
+from langchain_chdb._sql import quote_identifier as _quote_identifier
+
 # ---------------------------------------------------------------------------
 # Distance strategies
 # ---------------------------------------------------------------------------
@@ -105,39 +107,28 @@ _DISTANCE_FN: dict[DistanceStrategy, tuple[str, bool]] = {
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _quote_identifier(name: str) -> str:
-    """Backtick-quote a SQL identifier; reject names that don't look right.
+def _bind(params: dict[str, Any], value: Any) -> str:
+    """Bind a scalar as a chDB param and return its ``{name:Type}`` placeholder.
 
-    chDB identifiers can in principle hold arbitrary characters via
-    backtick escaping, but our public surface only accepts simple ASCII
-    names so we can refuse anything else loudly.
+    Values never reach the SQL text — they are sent as server-side parameters.
+    ``None`` is the one exception (rendered as the ``NULL`` literal, which cannot
+    carry a value). Booleans bind as 0/1.
     """
-    if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
-        raise ValueError(
-            f"Invalid identifier {name!r}: must match [A-Za-z_][A-Za-z0-9_]*"
-        )
-    return f"`{name}`"
-
-
-def _escape_string_literal(value: str) -> str:
-    """SQL single-quote a string literal."""
-    if not isinstance(value, str):
-        raise TypeError(f"string expected, got {type(value).__name__}")
-    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
-def _format_scalar_for_sql(value: Any) -> str:
-    """Render a Python scalar as a chDB SQL literal."""
     if value is None:
         return "NULL"
+    name = f"p{len(params)}"
     if isinstance(value, bool):
-        return "1" if value else "0"
+        params[name] = 1 if value else 0
+        return f"{{{name}:UInt8}}"
     if isinstance(value, int):
-        return str(value)
+        params[name] = value
+        return f"{{{name}:Int64}}"
     if isinstance(value, float):
-        return repr(value)
+        params[name] = value
+        return f"{{{name}:Float64}}"
     if isinstance(value, str):
-        return _escape_string_literal(value)
+        params[name] = value
+        return f"{{{name}:String}}"
     raise TypeError(
         f"unsupported value type for filter: {type(value).__name__} "
         f"({value!r}). Allowed: str, int, float, bool, None."
@@ -145,21 +136,11 @@ def _format_scalar_for_sql(value: Any) -> str:
 
 
 def _format_embedding_literal(vector: list[float]) -> str:
-    """Render a float vector as a chDB ``Array(Float32)`` literal."""
-    return "[" + ",".join(repr(float(v)) for v in vector) + "]"
+    """Render a float vector as a chDB ``Array(Float32)`` literal.
 
-
-def _format_json_literal(value: Any) -> str:
-    """Render a JSON-serializable Python value as a chDB JSON column literal.
-
-    chDB accepts a JSON column literal as a single-quoted JSON string,
-    e.g. ``'{"k":"v"}'``.
+    Floats are not an injection vector, so the vector is inlined directly.
     """
-    if value is None:
-        value = {}
-    return _escape_string_literal(
-        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    )
+    return "[" + ",".join(repr(float(v)) for v in vector) + "]"
 
 
 # ---------------------------------------------------------------------------
@@ -187,33 +168,33 @@ def _json_path_expr(metadata_column: str, key: str) -> str:
     return f"{_quote_identifier(metadata_column)}.{key}"
 
 
-def _equality_clause(metadata_column: str, key: str, value: Any) -> str:
+def _equality_clause(metadata_column: str, key: str, value: Any, params: dict[str, Any]) -> str:
     path = _json_path_expr(metadata_column, key)
     if isinstance(value, str):
         # Cast both sides to String to avoid the Dynamic-type IN/comparison
         # mismatches on chDB's typed JSON path.
-        return f"toString({path}) = {_escape_string_literal(value)}"
-    return f"{path} = {_format_scalar_for_sql(value)}"
+        return f"toString({path}) = {_bind(params, value)}"
+    return f"{path} = {_bind(params, value)}"
 
 
-def _comparison_clause(metadata_column: str, key: str, op: str, value: Any) -> str:
+def _comparison_clause(metadata_column: str, key: str, op: str, value: Any, params: dict[str, Any]) -> str:
     path = _json_path_expr(metadata_column, key)
-    return f"{path} {_COMPARISON_OPS[op]} {_format_scalar_for_sql(value)}"
+    return f"{path} {_COMPARISON_OPS[op]} {_bind(params, value)}"
 
 
-def _field_dict_clause(metadata_column: str, key: str, op_dict: dict[str, Any]) -> str:
+def _field_dict_clause(metadata_column: str, key: str, op_dict: dict[str, Any], params: dict[str, Any]) -> str:
     parts: list[str] = []
     for op, op_val in op_dict.items():
         if op == "$in":
             if not isinstance(op_val, list) or not op_val:
                 raise ValueError(f"$in requires a non-empty list, got {op_val!r}")
-            sub = [_equality_clause(metadata_column, key, v) for v in op_val]
+            sub = [_equality_clause(metadata_column, key, v, params) for v in op_val]
             parts.append("(" + " OR ".join(sub) + ")")
         elif op == "$ne" and isinstance(op_val, str):
             path = _json_path_expr(metadata_column, key)
-            parts.append(f"toString({path}) != {_escape_string_literal(op_val)}")
+            parts.append(f"toString({path}) != {_bind(params, op_val)}")
         elif op in _COMPARISON_OPS:
-            parts.append(_comparison_clause(metadata_column, key, op, op_val))
+            parts.append(_comparison_clause(metadata_column, key, op, op_val, params))
         else:
             raise ValueError(
                 f"Unsupported filter operator {op!r} on field {key!r}. "
@@ -222,11 +203,13 @@ def _field_dict_clause(metadata_column: str, key: str, op_dict: dict[str, Any]) 
     return " AND ".join(parts) if len(parts) > 1 else parts[0]
 
 
-def _filter_to_sql(filter_obj: dict[str, Any], metadata_column: str) -> str:
+def _filter_to_sql(filter_obj: dict[str, Any], metadata_column: str, params: dict[str, Any]) -> str:
     """Compile a filter DSL dict into a chDB SQL boolean expression.
 
-    Raises ``ValueError`` for any unknown operator. Empty filter returns
-    the empty string; the caller decides whether to emit a ``WHERE`` at all.
+    Filter *values* are appended to ``params`` and referenced as bound
+    parameters — never interpolated. Raises ``ValueError`` for any unknown
+    operator. Empty filter returns the empty string; the caller decides whether
+    to emit a ``WHERE`` at all.
     """
     if not isinstance(filter_obj, dict):
         raise ValueError(
@@ -240,15 +223,15 @@ def _filter_to_sql(filter_obj: dict[str, Any], metadata_column: str) -> str:
         if key == "$and":
             if not isinstance(value, list):
                 raise ValueError(f"$and requires a list of sub-filters, got {value!r}")
-            sub_clauses = [_filter_to_sql(f, metadata_column) for f in value]
+            sub_clauses = [_filter_to_sql(f, metadata_column, params) for f in value]
             parts.append("(" + " AND ".join(c for c in sub_clauses if c) + ")")
         elif key == "$or":
             if not isinstance(value, list):
                 raise ValueError(f"$or requires a list of sub-filters, got {value!r}")
-            sub_clauses = [_filter_to_sql(f, metadata_column) for f in value]
+            sub_clauses = [_filter_to_sql(f, metadata_column, params) for f in value]
             parts.append("(" + " OR ".join(c for c in sub_clauses if c) + ")")
         elif key == "$not":
-            sub_clause = _filter_to_sql(value, metadata_column)
+            sub_clause = _filter_to_sql(value, metadata_column, params)
             parts.append(f"NOT ({sub_clause})")
         elif key.startswith("$"):
             raise ValueError(
@@ -256,9 +239,9 @@ def _filter_to_sql(filter_obj: dict[str, Any], metadata_column: str) -> str:
                 f"Allowed: $and, $or, $not."
             )
         elif isinstance(value, dict):
-            parts.append(_field_dict_clause(metadata_column, key, value))
+            parts.append(_field_dict_clause(metadata_column, key, value, params))
         else:
-            parts.append(_equality_clause(metadata_column, key, value))
+            parts.append(_equality_clause(metadata_column, key, value, params))
 
     return " AND ".join(parts)
 
@@ -394,9 +377,9 @@ class ChDBVectorStore(VectorStore):
         sql = (
             "SELECT 1 FROM system.tables "
             "WHERE database = currentDatabase() "
-            f"AND name = {_escape_string_literal(self._table_name)} LIMIT 1"
+            "AND name = {tbl:String} LIMIT 1"
         )
-        return bool(self._query_jsoneachrow(sql))
+        return bool(self._query_jsoneachrow(sql, {"tbl": self._table_name}))
 
     def _ready_for_read(self) -> bool:
         """Mark the table as initialized on first read against an existing
@@ -516,11 +499,13 @@ class ChDBVectorStore(VectorStore):
         id_list = list(ids)
         if not id_list:
             return
-        in_clause = ", ".join(_escape_string_literal(i) for i in id_list)
+        params: dict[str, Any] = {}
+        in_clause = ", ".join(_bind(params, i) for i in id_list)
         self._get_session().query(
             f"ALTER TABLE {_quote_identifier(self._table_name)} "
             f"DELETE WHERE {_quote_identifier(self._id_column)} IN ({in_clause}) "
-            f"SETTINGS mutations_sync = 1"
+            f"SETTINGS mutations_sync = 1",
+            params=params,
         )
 
     def _insert_rows(
@@ -529,13 +514,17 @@ class ChDBVectorStore(VectorStore):
         documents: list[Document],
         embeddings: list[list[float]],
     ) -> None:
+        # id / content / metadata are bound per row; the embedding is a float
+        # vector (not injectable) and is inlined as an Array(Float32) literal.
+        params: dict[str, Any] = {}
         rows: list[str] = []
         for doc_id, doc, vec in zip(ids, documents, embeddings, strict=True):
+            meta_json = json.dumps(doc.metadata or {}, ensure_ascii=False, separators=(",", ":"))
             rows.append(
                 "("
-                f"{_escape_string_literal(doc_id)}, "
-                f"{_escape_string_literal(doc.page_content)}, "
-                f"{_format_json_literal(doc.metadata or {})}, "
+                f"{_bind(params, doc_id)}, "
+                f"{_bind(params, doc.page_content)}, "
+                f"{_bind(params, meta_json)}, "
                 f"{_format_embedding_literal(vec)}"
                 ")"
             )
@@ -545,7 +534,8 @@ class ChDBVectorStore(VectorStore):
             f"{_quote_identifier(self._content_column)}, "
             f"{_quote_identifier(self._metadata_column)}, "
             f"{_quote_identifier(self.EMBEDDING_COLUMN)}) "
-            f"VALUES " + ",\n".join(rows)
+            f"VALUES " + ",\n".join(rows),
+            params=params,
         )
 
     def _require_writable(self) -> None:
@@ -660,7 +650,8 @@ class ChDBVectorStore(VectorStore):
         if not self._ready_for_read():
             return []
 
-        in_clause = ", ".join(_escape_string_literal(i) for i in ids)
+        params: dict[str, Any] = {}
+        in_clause = ", ".join(_bind(params, i) for i in ids)
         sql = (
             f"SELECT {_quote_identifier(self._id_column)} AS id, "
             f"{_quote_identifier(self._content_column)} AS content, "
@@ -668,7 +659,7 @@ class ChDBVectorStore(VectorStore):
             f"FROM {_quote_identifier(self._table_name)} "
             f"WHERE {_quote_identifier(self._id_column)} IN ({in_clause})"
         )
-        rows = self._query_jsoneachrow(sql)
+        rows = self._query_jsoneachrow(sql, params)
         by_id: dict[str, Document] = {}
         for row in rows:
             by_id[row["id"]] = Document(
@@ -714,9 +705,10 @@ class ChDBVectorStore(VectorStore):
         emb_col = _quote_identifier(self.EMBEDDING_COLUMN)
         q_lit = _format_embedding_literal(embedding)
 
+        params: dict[str, Any] = {}
         where_sql = ""
         if filter:
-            clause = _filter_to_sql(filter, self._metadata_column)
+            clause = _filter_to_sql(filter, self._metadata_column, params)
             if clause:
                 where_sql = f"WHERE {clause} "
 
@@ -730,7 +722,7 @@ class ChDBVectorStore(VectorStore):
             f"ORDER BY score {order} "
             f"LIMIT {int(k)}"
         )
-        rows = self._query_jsoneachrow(sql)
+        rows = self._query_jsoneachrow(sql, params)
         return [
             (
                 Document(
@@ -946,9 +938,9 @@ class ChDBVectorStore(VectorStore):
     # plumbing
     # ------------------------------------------------------------------
 
-    def _query_jsoneachrow(self, sql: str) -> list[dict[str, Any]]:
+    def _query_jsoneachrow(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Run a query and parse JSONEachRow output into Python dicts."""
-        raw = self._get_session().query(sql, "JSONEachRow")
+        raw = self._get_session().query(sql, "JSONEachRow", params=params or {})
         text = raw if isinstance(raw, str) else str(raw)
         rows: list[dict[str, Any]] = []
         for line in text.splitlines():

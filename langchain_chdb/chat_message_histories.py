@@ -64,36 +64,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import re
 import time
 from typing import Any
 
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+from langchain_chdb._sql import quote_identifier as _quote_identifier
 
 
-def _quote_identifier(name: str) -> str:
-    if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
-        raise ValueError(
-            f"Invalid identifier {name!r}: must match [A-Za-z_][A-Za-z0-9_]*"
-        )
-    return f"`{name}`"
-
-
-def _escape_string_literal(value: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"string expected, got {type(value).__name__}")
-    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
-def _format_json_literal(value: Any) -> str:
-    if value is None:
-        value = {}
-    return _escape_string_literal(
-        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    )
+def _payload_json(value: Any) -> str:
+    """Serialize a message payload to a JSON string (bound as a param, not inlined)."""
+    return json.dumps({} if value is None else value, ensure_ascii=False, separators=(",", ":"))
 
 
 class ChDBChatMessageHistory(BaseChatMessageHistory):
@@ -174,7 +156,8 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
         rows = self._query_jsoneachrow(
             "SELECT 1 FROM system.tables "
             "WHERE database = currentDatabase() "
-            f"AND name = {_escape_string_literal(self._table_name)} LIMIT 1"
+            "AND name = {tbl:String} LIMIT 1",
+            {"tbl": self._table_name},
         )
         return bool(rows)
 
@@ -230,26 +213,32 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
         self._ensure_table()
         next_seq = self._next_seq_for_session()
 
+        # Values are bound as chDB params (never interpolated). session_id is
+        # constant across the batch; role/payload are bound per row; seq and the
+        # timestamp are integers we compute here, so they are inlined safely.
+        params: dict[str, Any] = {"sid": self._session_id}
         rows: list[str] = []
         now_micro = int(time.time() * 1_000_000)
         for i, msg in enumerate(messages):
             ts_micro = now_micro + i  # informational; not used for ordering
             seq = next_seq + i
-            payload = message_to_dict(msg)
+            params[f"role{i}"] = msg.type
+            params[f"pl{i}"] = _payload_json(message_to_dict(msg))
             rows.append(
                 "("
-                f"{_escape_string_literal(self._session_id)}, "
+                "{sid:String}, "
                 f"{seq}, "
                 f"fromUnixTimestamp64Micro({ts_micro}), "
-                f"{_escape_string_literal(msg.type)}, "
-                f"{_format_json_literal(payload)}"
+                f"{{role{i}:String}}, "
+                f"{{pl{i}:String}}"
                 ")"
             )
 
         self._get_session().query(
             f"INSERT INTO {_quote_identifier(self._table_name)} "
             "(session_id, seq, ts, role, payload) VALUES "
-            + ",\n".join(rows)
+            + ",\n".join(rows),
+            params=params,
         )
 
     def _next_seq_for_session(self) -> int:
@@ -260,7 +249,8 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
         """
         rows = self._query_jsoneachrow(
             f"SELECT max(seq) AS m FROM {_quote_identifier(self._table_name)} "
-            f"WHERE session_id = {_escape_string_literal(self._session_id)}"
+            "WHERE session_id = {sid:String}",
+            {"sid": self._session_id},
         )
         if not rows:
             return 1
@@ -282,8 +272,9 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
             return
         self._get_session().query(
             f"ALTER TABLE {_quote_identifier(self._table_name)} "
-            f"DELETE WHERE session_id = {_escape_string_literal(self._session_id)} "
-            "SETTINGS mutations_sync = 1"
+            "DELETE WHERE session_id = {sid:String} "
+            "SETTINGS mutations_sync = 1",
+            params={"sid": self._session_id},
         )
 
     @property
@@ -293,8 +284,9 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
             return []
         rows = self._query_jsoneachrow(
             f"SELECT payload FROM {_quote_identifier(self._table_name)} "
-            f"WHERE session_id = {_escape_string_literal(self._session_id)} "
-            "ORDER BY seq ASC"
+            "WHERE session_id = {sid:String} "
+            "ORDER BY seq ASC",
+            {"sid": self._session_id},
         )
         if not rows:
             return []
@@ -320,8 +312,8 @@ class ChDBChatMessageHistory(BaseChatMessageHistory):
     # plumbing
     # ------------------------------------------------------------------
 
-    def _query_jsoneachrow(self, sql: str) -> list[dict[str, Any]]:
-        raw = self._get_session().query(sql, "JSONEachRow")
+    def _query_jsoneachrow(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        raw = self._get_session().query(sql, "JSONEachRow", params=params or {})
         text = raw if isinstance(raw, str) else str(raw)
         out: list[dict[str, Any]] = []
         for line in text.splitlines():
