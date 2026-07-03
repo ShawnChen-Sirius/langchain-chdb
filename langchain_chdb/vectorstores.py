@@ -170,6 +170,10 @@ def _json_path_expr(metadata_column: str, key: str) -> str:
 
 def _equality_clause(metadata_column: str, key: str, value: Any, params: dict[str, Any]) -> str:
     path = _json_path_expr(metadata_column, key)
+    if value is None:
+        # `path = NULL` is never true in SQL; equality-to-None means "is null".
+        # This also gives `$in` the right behavior for a None list member.
+        return f"isNull({path})"
     if isinstance(value, str):
         # Cast both sides to String to avoid the Dynamic-type IN/comparison
         # mismatches on chDB's typed JSON path.
@@ -178,6 +182,13 @@ def _equality_clause(metadata_column: str, key: str, value: Any, params: dict[st
 
 
 def _comparison_clause(metadata_column: str, key: str, op: str, value: Any, params: dict[str, Any]) -> str:
+    if value is None:
+        # Ordering against NULL (`path > NULL`) is always false/undefined; reject
+        # it loudly rather than silently returning no rows. (None equality is
+        # handled by _equality_clause / the $ne branch as is/is-not null.)
+        raise ValueError(
+            f"comparison operator {op!r} on field {key!r} does not accept None"
+        )
     path = _json_path_expr(metadata_column, key)
     return f"{path} {_COMPARISON_OPS[op]} {_bind(params, value)}"
 
@@ -190,6 +201,9 @@ def _field_dict_clause(metadata_column: str, key: str, op_dict: dict[str, Any], 
                 raise ValueError(f"$in requires a non-empty list, got {op_val!r}")
             sub = [_equality_clause(metadata_column, key, v, params) for v in op_val]
             parts.append("(" + " OR ".join(sub) + ")")
+        elif op == "$ne" and op_val is None:
+            # `$ne: None` means "is not null" — `path != NULL` is never true.
+            parts.append(f"isNotNull({_json_path_expr(metadata_column, key)})")
         elif op == "$ne" and isinstance(op_val, str):
             path = _json_path_expr(metadata_column, key)
             parts.append(f"toString({path}) != {_bind(params, op_val)}")

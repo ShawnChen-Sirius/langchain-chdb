@@ -28,6 +28,35 @@ def test_filter_binds_operator_and_in_values():
     assert set(params.values()) == {2020, "x", "y"}
 
 
+def test_none_equality_is_null_not_bound():
+    # `{field: None}` must become `isNull(...)`, not `= NULL` (never true).
+    params: dict = {}
+    sql = _filter_to_sql({"deleted_at": None}, "metadata", params)
+    assert "isNull(" in sql
+    assert "NULL" not in sql.replace("isNull", "")  # no bare NULL literal
+    assert params == {}
+
+
+def test_ne_none_is_not_null():
+    params: dict = {}
+    sql = _filter_to_sql({"deleted_at": {"$ne": None}}, "metadata", params)
+    assert "isNotNull(" in sql
+    assert params == {}
+
+
+def test_in_with_none_member_uses_is_null():
+    params: dict = {}
+    sql = _filter_to_sql({"tag": {"$in": ["x", None]}}, "metadata", params)
+    assert "isNull(" in sql
+    assert set(params.values()) == {"x"}
+
+
+def test_ordering_operator_rejects_none():
+    for op in ("$gt", "$gte", "$lt", "$lte"):
+        with pytest.raises(ValueError, match="does not accept None"):
+            _filter_to_sql({"year": {op: None}}, "metadata", {})
+
+
 def test_quote_identifier_delegates_but_keeps_strict_policy():
     assert quote_identifier("events") == "`events`"
     with pytest.raises(ValueError, match="Invalid identifier"):

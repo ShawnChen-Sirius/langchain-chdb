@@ -87,7 +87,11 @@ ignore = [
 ]
 
 [tool.mypy]
-python_version = "3.10"
+# Target 3.12 so mypy accepts numpy 2.x's shipped stubs, which use PEP 695
+# `type` statements that mypy rejects as a syntax error under a lower target
+# (mypy reaches numpy by following imports through the untyped chdb dependency).
+# Real 3.10-runtime compatibility is guarded by the unit-test matrix (3.10–3.13).
+python_version = "3.12"
 strict = false
 warn_unused_ignores = true
 ignore_missing_imports = true
